@@ -6,7 +6,6 @@ import {
   VmxCategoryId,
   VMX_CATEGORIES,
   BenchmarkSet,
-  CategoryResult,
 } from "./domain/vmx-domain";
 import "./vmx-ui-overrides.css"; // IMPORTANT: load overrides once, globally
 import { Matrix } from "./components/Matrix";
@@ -15,8 +14,6 @@ import { BenchmarkAdmin } from "./components/BenchmarkAdmin";
 import { BenchmarkLibraryAdmin } from "./components/BenchmarkLibraryAdmin";
 import { AdvisoryReadout } from "./components/AdvisoryReadout";
 import { DocumentationOverlay } from "./components/DocumentationOverlay";
-import { SoftCostsCashflowPanel } from "./components/SoftCostsCashflowPanel";
-import { AdminGuardrails, GuardrailsState } from "./components/AdminGuardrails";
 import {
   BenchmarkLibrary,
   TierId,
@@ -30,14 +27,55 @@ import {
   tierLabel,
 } from "./data/benchmark-library-storage";
 import { formatMoney, formatPct } from "./utils/format";
-import { VMX_APP_VERSION, formatProvenanceDate } from "./config/vmx-meta";
-import { exportClientPackZip, DeltaRowExport } from "./utils/exportClientPack";
-import { SoftCostsConfig, loadSoftCostsConfig, computeCashflowSchedule } from "./utils/softCosts";
 
 function buildDefaultSelections(): Record<VmxCategoryId, ScenarioSelection> {
   const rec = {} as Record<VmxCategoryId, ScenarioSelection>;
   for (const c of VMX_CATEGORIES) rec[c.id] = { categoryId: c.id, band: "MEDIUM" };
   return rec;
+}
+
+function normalizeSelections(
+  input: unknown,
+  fallback: Record<VmxCategoryId, ScenarioSelection>
+): Record<VmxCategoryId, ScenarioSelection> {
+  try {
+    const parsed = input as Record<string, ScenarioSelection>;
+    if (!parsed || typeof parsed !== "object") return fallback;
+
+    const out = { ...fallback };
+    for (const c of VMX_CATEGORIES) {
+      const maybe = parsed[c.id];
+      if (
+        maybe &&
+        typeof maybe === "object" &&
+        (maybe.band === "LOW" || maybe.band === "MEDIUM" || maybe.band === "HIGH") &&
+        maybe.categoryId === c.id
+      ) {
+        out[c.id] = maybe as ScenarioSelection;
+      }
+    }
+    return out;
+  } catch {
+    return fallback;
+  }
+}
+
+function readJson<T>(key: string): T | null {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+function writeJson(key: string, value: unknown) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // ignore
+  }
 }
 
 function pickSecondRegionId(lib: BenchmarkLibrary, primaryId: string) {
@@ -64,21 +102,78 @@ function pctToInput(p: number) {
   if (!Number.isFinite(p)) return "0.0";
   return (p * 100).toFixed(1);
 }
-
 function inputToPct(v: string) {
   const n = Number(v);
   if (!Number.isFinite(n)) return 0;
   return n / 100;
 }
 
+function computeSafe({
+  areaSqft,
+  benchmark,
+  selections,
+}: {
+  areaSqft: number;
+  benchmark: BenchmarkSet;
+  selections: ScenarioSelection[];
+}): { result: ReturnType<typeof computeScenarioResult> | null; error: string | null } {
+  try {
+    const result = computeScenarioResult({ areaSqft, benchmark, selections });
+    return { result, error: null };
+  } catch (e) {
+    return { result: null, error: e instanceof Error ? e.message : "Unknown error" };
+  }
+}
+
 export default function App() {
-  const [areaSqft, setAreaSqft] = useState<number>(15000);
+  // ---------------------------
+  // Persistent UI state
+  // ---------------------------
+  const [areaSqft, setAreaSqft] = useState<number>(() => {
+    try {
+      const raw = localStorage.getItem("vmx_area_sqft_v1");
+      const parsed = raw ? Number(raw) : 15000;
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : 15000;
+    } catch {
+      return 15000;
+    }
+  });
 
   const [showDocs, setShowDocs] = useState(false);
-  const [showGuardrails, setShowGuardrails] = useState(false);
 
-  // Soft costs / escalation / cashflow (visible to all; JSON editable)
-  const [softCostsConfig, setSoftCostsConfig] = useState<SoftCostsConfig>(() => loadSoftCostsConfig());
+  // Used to keep hash in sync with overlay open/close
+  const setDocsHash = (open: boolean) => {
+    try {
+      if (open) {
+        if (window.location.hash !== "#docs") window.location.hash = "docs";
+      } else {
+        if (window.location.hash) {
+          window.history.replaceState(null, "", window.location.pathname + window.location.search);
+        }
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const openDocs = () => {
+    setShowDocs(true);
+    setDocsHash(true);
+  };
+
+  const closeDocs = () => {
+    setShowDocs(false);
+    setDocsHash(false);
+  };
+
+  useEffect(() => {
+    const syncFromHash = () => {
+      setShowDocs(window.location.hash === "#docs");
+    };
+    syncFromHash();
+    window.addEventListener("hashchange", syncFromHash);
+    return () => window.removeEventListener("hashchange", syncFromHash);
+  }, []);
 
   useEffect(() => {
     const cleanup = () => document.body.classList.remove("print-vmx-report");
@@ -86,18 +181,44 @@ export default function App() {
     return () => window.removeEventListener("afterprint", cleanup);
   }, []);
 
+  // Persist area on changes
+  useEffect(() => {
+    try {
+      localStorage.setItem("vmx_area_sqft_v1", String(areaSqft));
+    } catch {
+      // ignore
+    }
+  }, [areaSqft]);
+
   const exportPdfReport = () => {
-    // Close any overlays first so the report prints cleanly
+    // Close overlays so report prints cleanly
     setShowDocs(false);
+    setDocsHash(false);
 
     document.body.classList.add("print-vmx-report");
     // Allow styles/layout to apply before printing
     window.setTimeout(() => window.print(), 50);
   };
 
-  const [selA, setSelA] = useState<Record<VmxCategoryId, ScenarioSelection>>(buildDefaultSelections());
-  const [selB, setSelB] = useState<Record<VmxCategoryId, ScenarioSelection>>(buildDefaultSelections());
+  // ---------------------------
+  // Selections (persisted)
+  // ---------------------------
+  const defaultSel = useMemo(() => buildDefaultSelections(), []);
+  const [selA, setSelA] = useState<Record<VmxCategoryId, ScenarioSelection>>(() => {
+    const saved = readJson<Record<VmxCategoryId, ScenarioSelection>>("vmx_sel_a_v1");
+    return normalizeSelections(saved, defaultSel);
+  });
+  const [selB, setSelB] = useState<Record<VmxCategoryId, ScenarioSelection>>(() => {
+    const saved = readJson<Record<VmxCategoryId, ScenarioSelection>>("vmx_sel_b_v1");
+    return normalizeSelections(saved, defaultSel);
+  });
 
+  useEffect(() => writeJson("vmx_sel_a_v1", selA), [selA]);
+  useEffect(() => writeJson("vmx_sel_b_v1", selB), [selB]);
+
+  // ---------------------------
+  // Benchmark library + selection
+  // ---------------------------
   const [library, setLibrary] = useState<BenchmarkLibrary>(() => getInitialLibrary());
   const initialSel = useMemo(() => getInitialSelection(library), [library]);
 
@@ -157,84 +278,7 @@ export default function App() {
     }
   });
 
-  // Provenance (shown in UI footer and exports)
-  const [datasetName, setDatasetName] = useState<string>(() => {
-    try {
-      return localStorage.getItem("vmx_dataset_name_v1") || "US — Reserve (VMX Demo)";
-    } catch {
-      return "US — Reserve (VMX Demo)";
-    }
-  });
-
-  const [datasetLastUpdated, setDatasetLastUpdated] = useState<string>(() => {
-    try {
-      return localStorage.getItem("vmx_dataset_last_updated_v1") || formatProvenanceDate(new Date());
-    } catch {
-      return formatProvenanceDate(new Date());
-    }
-  });
-
-  const [datasetAssumptions, setDatasetAssumptions] = useState<string>(() => {
-    try {
-      return (
-        localStorage.getItem("vmx_dataset_assumptions_v1") ||
-        "Guardrails calibrated for early-stage concept budgeting; benchmarks are $/sf by category; targets are directional ranges (not contract pricing)."
-      );
-    } catch {
-      return "Guardrails calibrated for early-stage concept budgeting; benchmarks are $/sf by category; targets are directional ranges (not contract pricing).";
-    }
-  });
-
-  const [autoStampOnBenchmarkChange, setAutoStampOnBenchmarkChange] = useState<boolean>(() => {
-    try {
-      const raw = localStorage.getItem("vmx_dataset_auto_stamp_v1");
-      return raw ? raw === "true" : true;
-    } catch {
-      return true;
-    }
-  });
-
-  // Driver definition (for Delta Heat)
-  const [driverMode, setDriverMode] = useState<"topN" | "pct">(() => {
-    try {
-      const raw = localStorage.getItem("vmx_driver_mode_v1");
-      return raw === "pct" ? "pct" : "topN";
-    } catch {
-      return "topN";
-    }
-  });
-
-  const [driverTopN, setDriverTopN] = useState<number>(() => {
-    try {
-      const raw = localStorage.getItem("vmx_driver_top_n_v1");
-      const parsed = raw ? Number(raw) : 3;
-      return Number.isFinite(parsed) ? Math.max(1, parsed) : 3;
-    } catch {
-      return 3;
-    }
-  });
-
-  const [driverPctThreshold, setDriverPctThreshold] = useState<number>(() => {
-    try {
-      const raw = localStorage.getItem("vmx_driver_pct_thr_v1");
-      const parsed = raw ? Number(raw) : 0.02;
-      return Number.isFinite(parsed) ? Math.max(0, parsed) : 0.02;
-    } catch {
-      return 0.02;
-    }
-  });
-
-  const [driverPctMaxDrivers, setDriverPctMaxDrivers] = useState<number>(() => {
-    try {
-      const raw = localStorage.getItem("vmx_driver_pct_cap_v1");
-      const parsed = raw ? Number(raw) : 7;
-      return Number.isFinite(parsed) ? Math.max(1, parsed) : 7;
-    } catch {
-      return 7;
-    }
-  });
-
-
+  // Keep region IDs valid if library changes
   useEffect(() => {
     if (!library.regions.some((r) => r.id === regionAId)) {
       setRegionAId(library.regions[0].id);
@@ -277,27 +321,13 @@ export default function App() {
     }
   }, [library]);
 
-  const autoStampRef = React.useRef(false);
-  useEffect(() => {
-    // Only stamp after initial mount, and only if enabled
-    if (!autoStampRef.current) {
-      autoStampRef.current = true;
-      return;
-    }
-    if (!autoStampOnBenchmarkChange) return;
-
-    // When benchmark library changes (admin edits), bump "Last updated"
-    const next = formatProvenanceDate(new Date());
-    setDatasetLastUpdated(next);
-  }, [library, autoStampOnBenchmarkChange]);
-
-
   const regionA = library.regions.find((r) => r.id === regionAId) ?? library.regions[0];
   const regionB = library.regions.find((r) => r.id === regionBId) ?? library.regions[0];
 
   const benchmarkA: BenchmarkSet = regionA.byTier[tier];
   const benchmarkB: BenchmarkSet = regionB.byTier[tier];
 
+  // Admin target region for editing
   const [adminRegionId, setAdminRegionId] = useState<string>(regionA.id);
   useEffect(() => setAdminRegionId(regionA.id), [regionA.id]);
 
@@ -314,37 +344,30 @@ export default function App() {
     setLibrary(nextLib);
   }
 
-  const [errorA, setErrorA] = useState<string | null>(null);
-  const [errorB, setErrorB] = useState<string | null>(null);
-
-  const resultA = useMemo(() => {
-    try {
-      setErrorA(null);
-      return computeScenarioResult({
-        areaSqft,
-        benchmark: benchmarkA,
-        selections: Object.values(selA),
-      });
-    } catch (e) {
-      setErrorA(e instanceof Error ? e.message : "Unknown error");
-      return null;
-    }
+  // ---------------------------
+  // Scenario results (NO setState during render)
+  // ---------------------------
+  const computedA = useMemo(() => {
+    return computeSafe({
+      areaSqft,
+      benchmark: benchmarkA,
+      selections: Object.values(selA),
+    });
   }, [areaSqft, benchmarkA, selA]);
 
-  const resultB = useMemo(() => {
-    if (!compareMode) return null;
-    try {
-      setErrorB(null);
-      return computeScenarioResult({
-        areaSqft,
-        benchmark: benchmarkB,
-        selections: Object.values(selB),
-      });
-    } catch (e) {
-      setErrorB(e instanceof Error ? e.message : "Unknown error");
-      return null;
-    }
+  const computedB = useMemo(() => {
+    if (!compareMode) return { result: null, error: null };
+    return computeSafe({
+      areaSqft,
+      benchmark: benchmarkB,
+      selections: Object.values(selB),
+    });
   }, [areaSqft, benchmarkB, selB, compareMode]);
+
+  const resultA = computedA.result;
+  const errorA = computedA.error;
+  const resultB = computedB.result;
+  const errorB = computedB.error;
 
   function setBandA(categoryId: VmxCategoryId, band: HeatBand) {
     setSelA((prev) => ({ ...prev, [categoryId]: { ...prev[categoryId], band } }));
@@ -359,8 +382,8 @@ export default function App() {
     const aTotal = resultA.totalCost > 0 ? resultA.totalCost : 1;
     const totalDelta = resultB.totalCost - resultA.totalCost;
 
-    const baseRows: DeltaRow[] = resultA.categories.map((a: CategoryResult) => {
-      const b = resultB.categories.find((x: CategoryResult) => x.categoryId === a.categoryId);
+    const baseRows: DeltaRow[] = resultA.categories.map((a) => {
+      const b = resultB.categories.find((x) => x.categoryId === a.categoryId);
       if (!b) throw new Error(`Missing category in Scenario B: ${a.categoryId}`);
 
       const deltaCost = b.cost - a.cost;
@@ -389,19 +412,10 @@ export default function App() {
 
     const eligible = [...baseRows].filter((r) => Math.abs(r.deltaCost) > 0);
     const byAbs = eligible.sort((x, y) => Math.abs(y.deltaCost) - Math.abs(x.deltaCost));
-    let driverIds = new Set<VmxCategoryId>();
-    if (driverMode === "topN") {
-      const n = Math.max(1, Math.floor(driverTopN));
-      driverIds = new Set(byAbs.slice(0, n).map((r) => r.categoryId));
-    } else {
-      const thr = Math.max(0, driverPctThreshold);
-      const cap = Math.max(1, Math.floor(driverPctMaxDrivers));
-      const candidates = byAbs.filter((r) => r.absFracOfATotal >= thr);
-      driverIds = new Set(candidates.slice(0, cap).map((r) => r.categoryId));
-    }
+    const topSet = new Set(byAbs.slice(0, 3).map((r) => r.categoryId));
 
     let rows = baseRows.map((r) => {
-      const isTopDriver = driverIds.has(r.categoryId);
+      const isTopDriver = topSet.has(r.categoryId);
       const heat: DeltaHeat = isTopDriver && r.heat === "low" && r.absFracOfATotal > 0 ? "medium" : r.heat;
       return { ...r, isTopDriver, heat };
     });
@@ -427,88 +441,24 @@ export default function App() {
       aTotal: resultA.totalCost,
       bTotal: resultB.totalCost,
     };
-  }, [compareMode, resultA, resultB, deltaMediumThr, deltaHighThr, deltaSort, deltaDriversOnly, driverMode, driverTopN, driverPctThreshold, driverPctMaxDrivers]);
-
-  // Soft costs + escalation + cashflow (derived from Scenario results)
-  const softA = useMemo(() => (resultA ? computeCashflowSchedule(resultA, softCostsConfig) : null), [resultA, softCostsConfig]);
-  const softB = useMemo(() => (compareMode && resultB ? computeCashflowSchedule(resultB, softCostsConfig) : null), [compareMode, resultB, softCostsConfig]);
-
-  const exportClientPack = async () => {
-    if (!resultA) {
-      alert("Nothing to export yet. Please ensure Scenario A has calculated results.");
-      return;
-    }
-
-    const generatedAtIso = new Date().toISOString();
-
-    const meta = {
-      appVersion: VMX_APP_VERSION,
-      datasetName,
-      datasetLastUpdated,
-      assumptions: datasetAssumptions,
-      areaSqft,
-      tierLabel: tierLabel(tier),
-      scenarioAName: compareMode ? regionA.name : "Scenario",
-      scenarioABenchmarkName: `${regionA.name} — ${tierLabel(tier)}`,
-      compareMode,
-      scenarioBName: compareMode ? regionB.name : undefined,
-      scenarioBBenchmarkName: compareMode ? `${regionB.name} — ${tierLabel(tier)}` : undefined,
-      generatedAtIso,
-    };
-
-    const deltaRows: DeltaRowExport[] | null =
-      compareMode && delta && resultB
-        ? delta.rows.map((r) => ({
-            categoryId: r.categoryId,
-            categoryLabel: r.categoryLabel,
-            direction: r.direction,
-            deltaCost: r.deltaCost,
-            deltaPct: r.deltaPct,
-            impactVsATotal: r.absFracOfATotal,
-            heat: r.heat,
-            isDriver: r.isTopDriver,
-          }))
-        : null;
-
-    try {
-      await exportClientPackZip({
-        meta,
-        selectionsA: selA,
-        resultA,
-        selectionsB: compareMode ? selB : null,
-        resultB: compareMode ? resultB : null,
-        deltaRows,
-        softCostsConfig,
-        softCostsA: softA ? softA.totals : undefined,
-        softCostsB: softB ? softB.totals : undefined,
-        cashflowA: softA ? softA.rows : undefined,
-        cashflowB: softB ? softB.rows : undefined,
-      });
-    } catch (e) {
-      console.error(e);
-      alert("Client pack export failed. Please open the browser console for details.");
-    }
-  };
-
+  }, [compareMode, resultA, resultB, deltaMediumThr, deltaHighThr, deltaSort, deltaDriversOnly]);
 
   return (
     <div className="container">
       <div className="topBar">
         <div>
           <h1>VMX — Visual Matrix</h1>
-          
+          <div className="muted">Hybrid Replit-first scaffold (GitHub/IONOS-ready)</div>
         </div>
 
         <div className="topBarActions noPrint">
-          <button type="button" className="docsBtn" onClick={() => setShowDocs(true)}>
+          <button type="button" className="docsBtn" onClick={openDocs}>
             Documentation
           </button>
         </div>
       </div>
 
-      {showDocs && (
-        <DocumentationOverlay onClose={() => setShowDocs(false)} onExportPdf={exportPdfReport} />
-      )}
+      {showDocs && <DocumentationOverlay onClose={closeDocs} onExportPdf={exportPdfReport} />}
 
       <div className="card">
         <div className="adminHeader">
@@ -526,7 +476,13 @@ export default function App() {
         <div className="adminTopGrid" style={{ gridTemplateColumns: "1fr 1fr 1fr" }}>
           <div>
             <label className="label">Area (sq ft)</label>
-            <input className="input" type="number" min={1} value={areaSqft} onChange={(e) => setAreaSqft(Number(e.target.value))} />
+            <input
+              className="input"
+              type="number"
+              min={1}
+              value={areaSqft}
+              onChange={(e) => setAreaSqft(Number(e.target.value))}
+            />
           </div>
 
           <div>
@@ -589,6 +545,7 @@ export default function App() {
           title="Scenario"
           areaSqft={areaSqft}
           setAreaSqft={setAreaSqft}
+          showAreaInput={false}
           benchmark={benchmarkA}
           selections={selA}
           setBand={setBandA}
@@ -770,7 +727,7 @@ export default function App() {
                 </table>
 
                 <div className="muted" style={{ marginTop: 10 }}>
-                  Heat is based on |Δ Cost| versus Scenario A total. Medium ≥ {pctToInput(deltaMediumThr)}% and High ≥ {pctToInput(deltaHighThr)}%. Drivers are {driverMode === "topN" ? `the top ${driverTopN} non-zero |Δ Cost| categories` : `categories with impact ≥ ${pctToInput(driverPctThreshold)}% (cap ${driverPctMaxDrivers})`}.
+                  Heat is based on |Δ Cost| versus Scenario A total. Medium ≥ {pctToInput(deltaMediumThr)}% and High ≥ {pctToInput(deltaHighThr)}%. Drivers are the top 3 non-zero |Δ Cost| categories.
                 </div>
               </>
             )}
@@ -800,116 +757,11 @@ export default function App() {
         <BenchmarkAdmin benchmark={currentBenchmarkForAdmin} setBenchmark={setCurrentBenchmark} />
       </BenchmarkLibraryAdmin>
 
-
-      <div className="card" style={{ marginTop: 12 }}>
-        <div className="adminHeader">
-          <div>
-            <h2>Admin — Guardrails & Provenance</h2>
-            <div className="muted">
-              Configure delta heat thresholds, driver rules, and export provenance metadata. (Category target bands live in Benchmark Admin above.)
-            </div>
-          </div>
-
-          <div className="adminHeaderBtns noPrint">
-            <button type="button" className="secondaryBtn" onClick={() => setShowGuardrails((p) => !p)}>
-              {showGuardrails ? "Hide Guardrails" : "Show Guardrails"}
-            </button>
-          </div>
-        </div>
-
-        {showGuardrails ? (
-          <AdminGuardrails
-            value={{
-              datasetName,
-              datasetLastUpdated,
-              datasetAssumptions,
-              autoStampOnBenchmarkChange,
-              deltaMediumThr,
-              deltaHighThr,
-              deltaSort,
-              deltaDriversOnly,
-              driverMode,
-              driverTopN,
-              driverPctThreshold,
-              driverPctMaxDrivers,
-            }}
-            onChange={(next: GuardrailsState) => {
-              setDatasetName(next.datasetName);
-              setDatasetLastUpdated(next.datasetLastUpdated);
-              setDatasetAssumptions(next.datasetAssumptions);
-              setAutoStampOnBenchmarkChange(next.autoStampOnBenchmarkChange);
-
-              setDeltaMediumThr(next.deltaMediumThr);
-              setDeltaHighThr(next.deltaHighThr);
-              setDeltaSort(next.deltaSort);
-              setDeltaDriversOnly(next.deltaDriversOnly);
-
-              setDriverMode(next.driverMode);
-              setDriverTopN(next.driverTopN);
-              setDriverPctThreshold(next.driverPctThreshold);
-              setDriverPctMaxDrivers(next.driverPctMaxDrivers);
-            }}
-            onStampNow={() => setDatasetLastUpdated(formatProvenanceDate(new Date()))}
-            onResetDefaults={() => {
-              setDatasetName("US — Reserve (VMX Demo)");
-              setDatasetLastUpdated(formatProvenanceDate(new Date()));
-              setDatasetAssumptions(
-                "Guardrails calibrated for early-stage concept budgeting; benchmarks are $/sf by category; targets are directional ranges (not contract pricing)."
-              );
-              setAutoStampOnBenchmarkChange(true);
-
-              setDeltaMediumThr(0.015);
-              setDeltaHighThr(0.03);
-              setDeltaSort("impact");
-              setDeltaDriversOnly(false);
-
-              setDriverMode("topN");
-              setDriverTopN(3);
-              setDriverPctThreshold(0.02);
-              setDriverPctMaxDrivers(7);
-            }}
-          />
-        ) : (
-          <div className="muted" style={{ marginTop: 10 }}>
-            Guardrails hidden. Click “Show Guardrails” to edit thresholds, driver rules, and provenance.
-          </div>
-        )}
-      </div>
-
       <SnapshotPanel current={resultA} />
-
-
-      <SoftCostsCashflowPanel
-        visibleToAll={true}
-        currency={resultA?.currency ?? "USD"}
-        compareMode={compareMode}
-        scenarioAName={regionA.name}
-        scenarioBName={regionB.name}
-        resultA={resultA}
-        resultB={resultB}
-        config={softCostsConfig}
-        setConfig={setSoftCostsConfig}
-      />
-
-
-      <div className="provenanceBar">
-        <div className="provLine">
-          <span className="provStrong">VMX v{VMX_APP_VERSION}</span>
-          <span> | Dataset: </span>
-          <span className="provStrong">{datasetName}</span>
-          <span> | Updated: </span>
-          <span className="provStrong">{datasetLastUpdated}</span>
-          <span> | Assumptions: </span>
-          <span>{datasetAssumptions}</span>
-        </div>
-      </div>
 
       <div className="footerActions noPrint">
         <button type="button" className="docsBtn" onClick={exportPdfReport}>
           Export PDF Report
-        </button>
-        <button type="button" className="secondaryBtn" onClick={exportClientPack}>
-          Export Client Pack (.zip)
         </button>
       </div>
     </div>
