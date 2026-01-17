@@ -3,6 +3,7 @@ import {
   computeScenarioResult,
   HeatBand,
   ScenarioSelection,
+  ScenarioResult,
   VmxCategoryId,
   VMX_CATEGORIES,
   BenchmarkSet,
@@ -33,9 +34,10 @@ import {
 import { formatMoney, formatPct } from "./utils/format";
 import { VMX_APP_VERSION, formatProvenanceDate } from "./config/vmx-meta";
 import { exportClientPackZip, DeltaRowExport } from "./utils/exportClientPack";
-import { SoftCostsConfig, loadSoftCostsConfig, computeCashflowSchedule } from "./utils/softCosts";
+import { SoftCostsConfig, SoftCostsComputed, loadSoftCostsConfig, computeCashflowSchedule } from "./utils/softCosts";
 import {
   ConstructionIndirectsConfigV1,
+  ConstructionIndirectsComputed,
   loadConstructionIndirectsConfig,
   saveConstructionIndirectsConfig,
   computeConstructionIndirects,
@@ -147,13 +149,11 @@ function scaleBenchmarkSetByCategory(
   categoryFactors: Partial<Record<VmxCategoryId, number>>,
   nameSuffix?: string
 ): BenchmarkSet {
-  const nextBands: HeatBand[] = benchmark.bands.map((b) => {
+  const nextBands = benchmark.bands.map((b) => {
     const f = categoryFactors[b.categoryId] ?? 1;
     return {
       ...b,
-      lowPsf: b.lowPsf * f,
-      mediumPsf: b.mediumPsf * f,
-      highPsf: b.highPsf * f,
+      psqft: b.psqft * f,
     };
   });
 
@@ -590,6 +590,30 @@ export default function App() {
       return 1.0;
     }
   });
+
+  // String input states for custom location multipliers (for controlled inputs)
+  const [locationFactorAInput, setLocationFactorAInput] = useState<string>(() => String(locationACustom));
+  const [locationFactorBInput, setLocationFactorBInput] = useState<string>(() => String(locationBCustom));
+
+  // Sync string inputs when numeric values change
+  useEffect(() => {
+    setLocationFactorAInput(String(locationACustom));
+  }, [locationACustom]);
+
+  useEffect(() => {
+    setLocationFactorBInput(String(locationBCustom));
+  }, [locationBCustom]);
+
+  // Parse string inputs back to numbers
+  useEffect(() => {
+    const n = Number(locationFactorAInput);
+    if (Number.isFinite(n) && n > 0) setLocationACustom(n);
+  }, [locationFactorAInput]);
+
+  useEffect(() => {
+    const n = Number(locationFactorBInput);
+    if (Number.isFinite(n) && n > 0) setLocationBCustom(n);
+  }, [locationFactorBInput]);
 
   const locationFactorA = locationAPreset === "custom" ? locationACustom : presetFactor(locationAPreset);
   const locationFactorB = locationBPreset === "custom" ? locationBCustom : presetFactor(locationBPreset);
@@ -1208,7 +1232,7 @@ export default function App() {
       rows,
       increases,
       decreases,
-      currency: resultA.currency,
+      currency: resultA?.currency ?? "USD",
       aTotal: resultA.totalCost,
       bTotal: resultB.totalCost,
     };
@@ -1402,12 +1426,12 @@ export default function App() {
       scenarioBTypology: compareMode ? typologyB : undefined,
       scenarioBLandCost: compareMode ? (landCostB || 0) : undefined,
 
-      baselineLocationId,
+      baselineLocationPreset,
       baselineTypology,
 
       // Rollups (for client pack summary)
-      grandTotalA,
-      grandTotalB: compareMode ? grandTotalB : undefined,
+      grandTotalA: grandTotalA?.grandTotal,
+      grandTotalB: compareMode ? grandTotalB?.grandTotal : undefined,
       generatedAtIso,
     };
 
@@ -1457,13 +1481,12 @@ export default function App() {
     locationName: string;
     locationFactor: number;
     typology: TypologyId;
-    landCost: number;
-    areaSqft: number;
+    landAcquisitionCost: number;
     result: ScenarioResult | null;
-    error: string | null;
-    indirects: ConstructionIndirects | null;
-    softTotals: SoftCostsComputed | undefined;
-    grand: { grandTotal: number } | null;
+    error?: string | null;
+    indirects: ConstructionIndirectsComputed | null;
+    soft: SoftCostsComputed | null;
+    grandTotal: number | null;
     driversTypology: DriverSummary | null;
     driversLocation: DriverSummary | null;
     watchouts: WatchoutLine[];
@@ -1473,16 +1496,17 @@ export default function App() {
     const currency = p.result?.currency ?? "USD";
     const directHard = p.result?.totalCost ?? 0;
     const contractTotal = p.indirects?.contractTotal ?? 0;
-    const softTotal = p.softTotals?.totalWithEscalation ?? 0;
-    const grandTotal = p.grand?.grandTotal ?? 0;
+    const softTotal = p.soft?.totalWithEscalation ?? 0;
+    const grandTotalVal = p.grandTotal ?? 0;
+    const areaSqftVal = p.result?.areaSqft ?? 0;
 
     const kpis = [
       { k: "Direct Hard Costs", v: directHard ? formatMoney(directHard, currency) : "—" },
       { k: "Construction Contract", v: contractTotal ? formatMoney(contractTotal, currency) : "—" },
       { k: "Owner Soft + Escalation", v: softTotal ? formatMoney(softTotal, currency) : "—" },
-      { k: "Land Acquisition", v: p.landCost ? formatMoney(p.landCost, currency) : "—" },
-      { k: "All-in Grand Total", v: grandTotal ? formatMoney(grandTotal, currency) : "—" },
-      { k: "All-in $/SF", v: grandTotal && p.areaSqft ? formatMoney(grandTotal / p.areaSqft, currency) : "—" },
+      { k: "Land Acquisition", v: p.landAcquisitionCost ? formatMoney(p.landAcquisitionCost, currency) : "—" },
+      { k: "All-in Grand Total", v: grandTotalVal ? formatMoney(grandTotalVal, currency) : "—" },
+      { k: "All-in $/SF", v: grandTotalVal && areaSqftVal ? formatMoney(grandTotalVal / areaSqftVal, currency) : "—" },
     ];
 
     const renderDriver = (title: string, d: DriverSummary | null) => {
@@ -1752,8 +1776,8 @@ export default function App() {
                 <label className="label">Quality Tier</label>
                 <select value={tier} onChange={(e) => setTier(e.target.value as any)}>
                   {TIERS.map((t) => (
-                    <option key={t.id} value={t.id}>
-                      {t.label}
+                    <option key={t} value={t}>
+                      {tierLabel(t)}
                     </option>
                   ))}
                 </select>
@@ -1779,7 +1803,7 @@ export default function App() {
                   <select value={regionAId} onChange={(e) => setRegionAId(e.target.value)}>
                     {library.regions.map((r) => (
                       <option key={r.id} value={r.id}>
-                        {r.label}
+                        {r.name}
                       </option>
                     ))}
                   </select>
@@ -1843,7 +1867,7 @@ export default function App() {
                     <select value={regionBId} onChange={(e) => setRegionBId(e.target.value)}>
                       {library.regions.map((r) => (
                         <option key={r.id} value={r.id}>
-                          {r.label}
+                          {r.name}
                         </option>
                       ))}
                     </select>
@@ -1912,16 +1936,17 @@ export default function App() {
           <div className={compareMode ? "compareGrid" : ""}>
             <LiteScenarioCard
               title="Scenario A"
-              subtitle={`${regionA?.label ?? ""}`}
-              regionName={regionA?.label ?? ""}
+              subtitle={`${regionA?.name ?? ""}`}
+              regionName={regionA?.name ?? ""}
               locationName={locationLabel(locationAPreset)}
               locationFactor={locationFactorA}
               typology={typologyA}
               landAcquisitionCost={landCostA}
               result={resultA}
+              error={errorA}
               indirects={indirectsA}
-              soft={softA}
-              grandTotal={grandTotalA}
+              soft={softA?.totals ?? null}
+              grandTotal={grandTotalA?.grandTotal ?? null}
               driversTypology={driversA_Typology}
               driversLocation={driversA_Location}
               watchouts={watchoutsA}
@@ -1930,16 +1955,17 @@ export default function App() {
             {compareMode && (
               <LiteScenarioCard
                 title="Scenario B"
-                subtitle={`${regionB?.label ?? ""}`}
-                regionName={regionB?.label ?? ""}
+                subtitle={`${regionB?.name ?? ""}`}
+                regionName={regionB?.name ?? ""}
                 locationName={locationLabel(locationBPreset)}
                 locationFactor={locationFactorB}
                 typology={typologyB}
                 landAcquisitionCost={landCostB}
                 result={resultB}
+                error={errorB}
                 indirects={indirectsB}
-                soft={softB}
-                grandTotal={grandTotalB}
+                soft={softB?.totals ?? null}
+                grandTotal={grandTotalB?.grandTotal ?? null}
                 driversTypology={driversB_Typology}
                 driversLocation={driversB_Location}
                 watchouts={watchoutsB}
@@ -1964,8 +1990,8 @@ export default function App() {
                 <tbody>
                   {delta.rows.slice(0, 8).map((r) => (
                     <tr key={r.categoryId}>
-                      <td>{r.label}</td>
-                      <td style={{ textAlign: "right" }}>{formatMoney(r.deltaCost)}</td>
+                      <td>{r.categoryLabel}</td>
+                      <td style={{ textAlign: "right" }}>{formatMoney(r.deltaCost, "USD")}</td>
                       <td style={{ textAlign: "right" }}>{formatPct(r.deltaPct)}</td>
                     </tr>
                   ))}
@@ -2620,13 +2646,13 @@ export default function App() {
               {driversA_Typology ? (
                 <>
                   <div style={{ marginTop: 6 }}>
-                    Overall: {formatMoney(driversA_Typology.totalDeltaCost, resultA.currency)} ({formatPct(driversA_Typology.totalDeltaPct)})
+                    Overall: {formatMoney(driversA_Typology.totalDeltaCost, resultA?.currency ?? "USD")} ({formatPct(driversA_Typology.totalDeltaPct)})
                   </div>
                   {driversA_Typology.lines.length > 0 ? (
                     <ul style={{ margin: "8px 0 0 18px" }}>
                       {driversA_Typology.lines.map((l) => (
                         <li key={`a_t_${l.categoryId}`}>
-                          {l.label}: {formatMoney(l.deltaCost, resultA.currency)} ({formatPct(l.deltaPct)})
+                          {l.label}: {formatMoney(l.deltaCost, resultA?.currency ?? "USD")} ({formatPct(l.deltaPct)})
                         </li>
                       ))}
                     </ul>
@@ -2651,13 +2677,13 @@ export default function App() {
               {driversA_Location ? (
                 <>
                   <div style={{ marginTop: 6 }}>
-                    Overall: {formatMoney(driversA_Location.totalDeltaCost, resultA.currency)} ({formatPct(driversA_Location.totalDeltaPct)})
+                    Overall: {formatMoney(driversA_Location.totalDeltaCost, resultA?.currency ?? "USD")} ({formatPct(driversA_Location.totalDeltaPct)})
                   </div>
                   {driversA_Location.lines.length > 0 ? (
                     <ul style={{ margin: "8px 0 0 18px" }}>
                       {driversA_Location.lines.map((l) => (
                         <li key={`a_l_${l.categoryId}`}>
-                          {l.label}: {formatMoney(l.deltaCost, resultA.currency)} ({formatPct(l.deltaPct)})
+                          {l.label}: {formatMoney(l.deltaCost, resultA?.currency ?? "USD")} ({formatPct(l.deltaPct)})
                         </li>
                       ))}
                     </ul>
@@ -2787,11 +2813,11 @@ export default function App() {
             <tbody>
               <tr>
                 <td style={{ padding: "8px" }}>Direct Hard Costs (7 categories)</td>
-                <td style={{ textAlign: "right", padding: "8px" }}>{formatMoney(resultA.totalCost, resultA.currency)}</td>
+                <td style={{ textAlign: "right", padding: "8px" }}>{formatMoney(resultA?.totalCost ?? 0, resultA?.currency ?? "USD")}</td>
                 {compareMode && resultB && <td style={{ textAlign: "right", padding: "8px" }}>{formatMoney(resultB.totalCost, resultB.currency)}</td>}
-                {compareMode && resultB && (
+                {compareMode && resultB && resultA && (
                   <td style={{ textAlign: "right", padding: "8px" }}>
-                    {formatMoney(resultB.totalCost - resultA.totalCost, resultA.currency)}
+                    {formatMoney(resultB.totalCost - resultA.totalCost, resultA?.currency ?? "USD")}
                   </td>
                 )}
               </tr>
@@ -2799,7 +2825,7 @@ export default function App() {
               <tr>
                 <td style={{ padding: "8px" }}>Construction Indirects (GCs + fee + contingency + GL)</td>
                 <td style={{ textAlign: "right", padding: "8px" }}>
-                  {indirectsA ? formatMoney(indirectsA.totalIndirects, resultA.currency) : "—"}
+                  {indirectsA ? formatMoney(indirectsA.totalIndirects, resultA?.currency ?? "USD") : "—"}
                 </td>
                 {compareMode && (
                   <td style={{ textAlign: "right", padding: "8px" }}>
@@ -2808,7 +2834,7 @@ export default function App() {
                 )}
                 {compareMode && (
                   <td style={{ textAlign: "right", padding: "8px" }}>
-                    {indirectsB && resultB ? formatMoney(indirectsB.totalIndirects - (indirectsA?.totalIndirects ?? 0), resultA.currency) : "—"}
+                    {indirectsB && resultB ? formatMoney(indirectsB.totalIndirects - (indirectsA?.totalIndirects ?? 0), resultA?.currency ?? "USD") : "—"}
                   </td>
                 )}
               </tr>
@@ -2818,7 +2844,7 @@ export default function App() {
                   <strong>Total Construction Contract</strong>
                 </td>
                 <td style={{ textAlign: "right", padding: "8px" }}>
-                  <strong>{indirectsA ? formatMoney(indirectsA.contractTotal, resultA.currency) : "—"}</strong>
+                  <strong>{indirectsA ? formatMoney(indirectsA.contractTotal, resultA?.currency ?? "USD") : "—"}</strong>
                 </td>
                 {compareMode && (
                   <td style={{ textAlign: "right", padding: "8px" }}>
@@ -2827,7 +2853,7 @@ export default function App() {
                 )}
                 {compareMode && (
                   <td style={{ textAlign: "right", padding: "8px" }}>
-                    <strong>{indirectsB && resultB ? formatMoney(indirectsB.contractTotal - (indirectsA?.contractTotal ?? 0), resultA.currency) : "—"}</strong>
+                    <strong>{indirectsB && resultB ? formatMoney(indirectsB.contractTotal - (indirectsA?.contractTotal ?? 0), resultA?.currency ?? "USD") : "—"}</strong>
                   </td>
                 )}
               </tr>
@@ -2837,16 +2863,16 @@ export default function App() {
                   <strong>Land Acquisition Cost</strong>
                 </td>
                 <td style={{ textAlign: "right", padding: "8px" }}>
-                  <strong>{formatMoney(landCostA || 0, resultA.currency)}</strong>
+                  <strong>{formatMoney(landCostA || 0, resultA?.currency ?? "USD")}</strong>
                 </td>
                 {compareMode && (
                   <td style={{ textAlign: "right", padding: "8px" }}>
-                    <strong>{formatMoney(landCostB || 0, resultA.currency)}</strong>
+                    <strong>{formatMoney(landCostB || 0, resultA?.currency ?? "USD")}</strong>
                   </td>
                 )}
                 {compareMode && (
                   <td style={{ textAlign: "right", padding: "8px" }}>
-                    <strong>{formatMoney((landCostB || 0) - (landCostA || 0), resultA.currency)}</strong>
+                    <strong>{formatMoney((landCostB || 0) - (landCostA || 0), resultA?.currency ?? "USD")}</strong>
                   </td>
                 )}
               </tr>
@@ -2854,7 +2880,7 @@ export default function App() {
               <tr>
                 <td style={{ padding: "8px" }}>Soft Costs (Owner-side)</td>
                 <td style={{ textAlign: "right", padding: "8px" }}>
-                  {softA ? formatMoney(softA.totals.softBase, resultA.currency) : "—"}
+                  {softA ? formatMoney(softA.totals.softBase, resultA?.currency ?? "USD") : "—"}
                 </td>
                 {compareMode && (
                   <td style={{ textAlign: "right", padding: "8px" }}>
@@ -2863,7 +2889,7 @@ export default function App() {
                 )}
                 {compareMode && (
                   <td style={{ textAlign: "right", padding: "8px" }}>
-                    {softB && resultB ? formatMoney(softB.totals.softBase - (softA?.totals.softBase ?? 0), resultA.currency) : "—"}
+                    {softB && resultB ? formatMoney(softB.totals.softBase - (softA?.totals.softBase ?? 0), resultA?.currency ?? "USD") : "—"}
                   </td>
                 )}
               </tr>
@@ -2871,7 +2897,7 @@ export default function App() {
               <tr>
                 <td style={{ padding: "8px" }}>Escalation (per Soft Costs settings)</td>
                 <td style={{ textAlign: "right", padding: "8px" }}>
-                  {softA ? formatMoney(softA.totals.escalationAmount, resultA.currency) : "—"}
+                  {softA ? formatMoney(softA.totals.escalationAmount, resultA?.currency ?? "USD") : "—"}
                 </td>
                 {compareMode && (
                   <td style={{ textAlign: "right", padding: "8px" }}>
@@ -2880,7 +2906,7 @@ export default function App() {
                 )}
                 {compareMode && (
                   <td style={{ textAlign: "right", padding: "8px" }}>
-                    {softB && resultB ? formatMoney(softB.totals.escalationAmount - (softA?.totals.escalationAmount ?? 0), resultA.currency) : "—"}
+                    {softB && resultB ? formatMoney(softB.totals.escalationAmount - (softA?.totals.escalationAmount ?? 0), resultA?.currency ?? "USD") : "—"}
                   </td>
                 )}
               </tr>
@@ -2890,7 +2916,7 @@ export default function App() {
                   <strong>GRAND TOTAL (All-in Project Cost)</strong>
                 </td>
                 <td style={{ textAlign: "right", padding: "10px 8px" }}>
-                  <strong>{grandTotalA ? formatMoney(grandTotalA.grandTotal, resultA.currency) : "—"}</strong>
+                  <strong>{grandTotalA ? formatMoney(grandTotalA.grandTotal, resultA?.currency ?? "USD") : "—"}</strong>
                 </td>
                 {compareMode && (
                   <td style={{ textAlign: "right", padding: "10px 8px" }}>
@@ -2899,7 +2925,7 @@ export default function App() {
                 )}
                 {compareMode && (
                   <td style={{ textAlign: "right", padding: "10px 8px" }}>
-                    <strong>{grandTotalB && resultB ? formatMoney(grandTotalB.grandTotal - (grandTotalA?.grandTotal ?? 0), resultA.currency) : "—"}</strong>
+                    <strong>{grandTotalB && resultB ? formatMoney(grandTotalB.grandTotal - (grandTotalA?.grandTotal ?? 0), resultA?.currency ?? "USD") : "—"}</strong>
                   </td>
                 )}
               </tr>
